@@ -80,6 +80,7 @@ module.exports = {
     assetOverwrite: parseBool(process.env.ASSET_OVERWRITE, false),
     assetDownloadDir: process.env.ASSET_DOWNLOAD_DIR || "downloads",
     assetKeyPrefix: process.env.ASSET_KEY_PREFIX || "Questions_Assets",
+    assetCleanupEnabled: parseBool(process.env.ASSET_CLEANUP_ENABLED, true),
     s3Bucket,
     s3Region,
     s3AccessKeyId,

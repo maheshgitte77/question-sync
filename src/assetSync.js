@@ -1,5 +1,6 @@
 const path = require("path");
 const crypto = require("crypto");
+const fs = require("fs");
 const config = require("./config");
 const { downloadToFile, uploadToS3 } = require("./storage");
 
@@ -116,6 +117,13 @@ const mirrorUrl = async ({ sourceUrl, key, slug, kind, problemType }) => {
             const s3Url = await uploadToS3(finalKey, downloadedPath);
             record.s3Url = s3Url;
             record.status = s3Url ? "uploaded" : "downloaded";
+            if (config.assetCleanupEnabled && downloadedPath) {
+                try {
+                    await fs.promises.unlink(downloadedPath);
+                } catch (_error) {
+                    // best-effort cleanup
+                }
+            }
             // log("Asset upload done.", { slug, kind, sourceUrl, key: finalKey, status: record.status });
             return { record, resultUrl: s3Url || sourceUrl };
         } catch (error) {
@@ -195,11 +203,11 @@ const syncSimpleUrlField = async (
     }
 };
 
-const syncDescriptionImages = async (detailData, slug, cache, problemType) => {
-    if (!detailData.description) return;
-    const matches = [...detailData.description.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)];
+const syncHtmlImages = async (detailData, field, slug, cache, problemType) => {
+    if (!detailData[field]) return;
+    const matches = [...detailData[field].matchAll(/<img[^>]+src=["']([^"']+)["']/gi)];
     if (!matches.length) return;
-    let updated = detailData.description;
+    let updated = detailData[field];
     for (const match of matches) {
         const sourceUrl = match[1];
         const key = extractKeyFromUrl(sourceUrl);
@@ -216,7 +224,7 @@ const syncDescriptionImages = async (detailData, slug, cache, problemType) => {
             updated = updated.replace(sourceUrl, resultUrl);
         }
     }
-    detailData.description = updated;
+    detailData[field] = updated;
 };
 
 const syncAttachments = async (detailData, slug, cache, problemType) => {
@@ -334,8 +342,9 @@ const sanitizeUrlCandidate = (value) => {
 };
 
 const extractUrls = (text) => {
-    if (!isHttpUrl(text) && !text.includes("http")) return [];
-    const matches = text.match(/https?:\/\/[^\s"'<>]+/gi);
+    const decoded = decodeHtmlEntities(text);
+    if (!isHttpUrl(decoded) && !decoded.includes("http")) return [];
+    const matches = decoded.match(/https?:\/\/[^\s"'<>]+/gi);
     if (!matches) return [];
     const cleaned = matches
         .map((url) => sanitizeUrlCandidate(url))
@@ -345,6 +354,24 @@ const extractUrls = (text) => {
 
 const replaceUrlsInText = async (detailData, text, slug, cache, problemType) => {
     let updated = text;
+    const htmlMatches = [...decodeHtmlEntities(text).matchAll(/<img[^>]+src=["']([^"']+)["']/gi)];
+    for (const match of htmlMatches) {
+        const sourceUrl = match[1];
+        const key = extractKeyFromUrl(sourceUrl);
+        const { record, resultUrl } = await mirrorUrlCached({
+            sourceUrl,
+            key,
+            slug,
+            kind: "deep_scan",
+            cache,
+            problemType
+        });
+        if (record) addAssetLog(detailData, record);
+        if (resultUrl && resultUrl !== sourceUrl) {
+            updated = updated.split(sourceUrl).join(resultUrl);
+        }
+    }
+
     const urls = extractUrls(text);
     for (const url of urls) {
         const key = extractKeyFromUrl(url);
@@ -422,14 +449,14 @@ const processDetailAssets = async (detailData, slug) => {
     const problemType = detailData.problem_type;
     if (PROJECT_BASED_TYPES.has(problemType) || detailData.extra_data?.project_based_problem_data) {
         await syncProjectBasedAssets(detailData, slug, cache, problemType);
-        await syncDescriptionImages(detailData, slug, cache, problemType);
         await syncAttachments(detailData, slug, cache, problemType);
     }
     if (problemType === "UIX") {
         await syncUixAssets(detailData, slug, cache, problemType);
-        await syncDescriptionImages(detailData, slug, cache, problemType);
         await syncAttachments(detailData, slug, cache, problemType);
     }
+    await syncHtmlImages(detailData, "description", slug, cache, problemType);
+    await syncHtmlImages(detailData, "editorial", slug, cache, problemType);
     await syncPrivateAttachments(detailData, slug, cache, problemType);
     await deepScanUrls(detailData, slug, cache, problemType);
 };
