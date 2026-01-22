@@ -29,9 +29,17 @@ const downloadToFile = async (url, destPath) => {
     if (!config.assetOverwrite && fs.existsSync(destPath)) {
         return destPath;
     }
+    const headers = {
+        Accept: "application/octet-stream,*/*;q=0.9",
+        "User-Agent": config.apiUserAgent
+    };
+    if (config.apiReferer) headers.Referer = config.apiReferer;
+    if (config.apiCookie) headers.Cookie = config.apiCookie;
+    if (config.apiCsrfToken) headers["X-Csrftoken"] = config.apiCsrfToken;
     const response = await axios.get(url, {
         responseType: "arraybuffer",
-        timeout: config.requestTimeoutMs
+        timeout: config.requestTimeoutMs,
+        headers
     });
     await ensureDir(destPath);
     await fs.promises.writeFile(destPath, Buffer.from(response.data));

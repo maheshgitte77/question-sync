@@ -224,7 +224,11 @@ const main = async () => {
                 ordered: false
             });
             listItemsSaved += bulkResult.upsertedCount || 0;
-            log("List items saved.", { upserted: bulkResult.upsertedCount || 0 });
+            log("List items saved.", {
+                upserted: bulkResult.upsertedCount || 0,
+                matched: bulkResult.matchedCount || 0,
+                modified: bulkResult.modifiedCount || 0
+            });
         }
 
         await updateState(stateCollection, {
@@ -239,7 +243,7 @@ const main = async () => {
 
         const slugs = itemsWithSlug.map((item) => item.slug);
         let existingSlugSet = new Set();
-        if (config.skipExistingDetails && slugs.length) {
+        if (slugs.length) {
             const existing = await detailCollection
                 .find({ slug: { $in: slugs } }, { projection: { slug: 1 } })
                 .toArray();
@@ -258,11 +262,16 @@ const main = async () => {
                 log("Detail skipped (already exists).", { slug: item.slug });
                 continue;
             }
+            if (!config.skipExistingDetails && existingSlugSet.has(item.slug)) {
+                log("Detail exists; re-fetching.", { slug: item.slug });
+            }
 
             let detailData;
+            const detailStart = Date.now();
             try {
                 detailRequests += 1;
                 await updateState(stateCollection, { detailRequests });
+                log("Detail request starting.", { slug: item.slug, offset });
                 detailData = await requestWithRetry(
                     () => fetchDetail(item.slug),
                     {
@@ -285,6 +294,7 @@ const main = async () => {
             }
 
             try {
+                log("Asset processing started.", { slug: item.slug });
                 await processDetailAssets(detailData, item.slug);
                 log("Assets processed.", { slug: item.slug });
             } catch (error) {
@@ -304,13 +314,20 @@ const main = async () => {
                 });
             }
 
-            await detailCollection.updateOne(
+            log("Detail update starting.", { slug: item.slug });
+            const detailResult = await detailCollection.updateOne(
                 { slug: item.slug },
                 { $set: buildDetailDoc(item.slug, detailData, meta) },
                 { upsert: true }
             );
             detailItemsSaved += 1;
-            log("Detail saved.", { slug: item.slug });
+            log("Detail saved.", {
+                slug: item.slug,
+                matched: detailResult.matchedCount || 0,
+                modified: detailResult.modifiedCount || 0,
+                upserted: detailResult.upsertedCount || 0,
+                durationMs: Date.now() - detailStart
+            });
 
             await updateState(stateCollection, {
                 detailItemsSaved,
@@ -323,7 +340,11 @@ const main = async () => {
                 config.detailDelayMinSec,
                 config.detailDelayMaxSec
             );
-            if (detailDelay > 0) await sleep(detailDelay);
+            if (detailDelay > 0) {
+                log("Detail delay.", { slug: item.slug, delayMs: detailDelay });
+                await sleep(detailDelay);
+                log("Detail delay done.", { slug: item.slug });
+            }
         }
 
         offset += config.listLimit;
@@ -338,6 +359,7 @@ const main = async () => {
         if (listDelay > 0) {
             log("List delay.", { delayMs: listDelay });
             await sleep(listDelay);
+            log("List delay done.", { delayMs: listDelay });
         }
     }
 };

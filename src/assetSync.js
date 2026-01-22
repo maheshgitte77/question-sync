@@ -1,16 +1,58 @@
 const path = require("path");
+const crypto = require("crypto");
 const config = require("./config");
 const { downloadToFile, uploadToS3 } = require("./storage");
 
 const PROJECT_BASED_TYPES = new Set(["PBT", "PBD", "PFE", "PFS"]);
 
+const log = (message, meta = null) => {
+    const stamp = new Date().toISOString();
+    if (meta) {
+        process.stdout.write(`[${stamp}] ${message} ${JSON.stringify(meta)}\n`);
+        return;
+    }
+    process.stdout.write(`[${stamp}] ${message}\n`);
+};
+
+const normalizeUrl = (url) => {
+    if (!url) return url;
+    try {
+        return new URL(url).toString();
+    } catch (_error) {
+        try {
+            return new URL(encodeURI(url)).toString();
+        } catch (_innerError) {
+            return url;
+        }
+    }
+};
+
 const extractKeyFromUrl = (url) => {
     try {
-        const parsed = new URL(url);
+        const parsed = new URL(normalizeUrl(url));
         return parsed.pathname.replace(/^\/+/, "");
     } catch (_error) {
         return null;
     }
+};
+
+const getExtensionFromUrl = (url) => {
+    try {
+        const parsed = new URL(normalizeUrl(url));
+        const ext = path.extname(parsed.pathname);
+        return ext || "";
+    } catch (_error) {
+        return "";
+    }
+};
+
+const buildNewKey = (url, slug, problemType) => {
+    const ext = getExtensionFromUrl(url);
+    const id = crypto.randomUUID();
+    const prefix = config.assetKeyPrefix || "assets";
+    const safeSlug = slug || "unknown";
+    const safeType = problemType || "unknown";
+    return `${prefix}/${safeType}/${safeSlug}/${id}${ext}`;
 };
 
 const addAssetLog = (detailData, record) => {
@@ -22,12 +64,16 @@ const addAssetLog = (detailData, record) => {
     detailData.extra_data.asset_sync.lastSyncedAt = new Date().toISOString();
 };
 
-const mirrorUrl = async ({ sourceUrl, key, slug, kind }) => {
+const mirrorUrl = async ({ sourceUrl, key, slug, kind, problemType }) => {
     if (!sourceUrl || !config.assetSyncEnabled) {
         return { record: null, resultUrl: sourceUrl };
     }
 
-    const finalKey = key || extractKeyFromUrl(sourceUrl);
+    const normalizedUrl = normalizeUrl(sourceUrl);
+    if (config.s3BaseUrl && normalizedUrl.startsWith(config.s3BaseUrl)) {
+        return { record: null, resultUrl: sourceUrl };
+    }
+    const finalKey = buildNewKey(sourceUrl, slug, problemType);
     if (!finalKey) {
         return { record: null, resultUrl: sourceUrl };
     }
@@ -40,31 +86,69 @@ const mirrorUrl = async ({ sourceUrl, key, slug, kind }) => {
         key: finalKey,
         localPath,
         s3Url: null,
-        status: "skipped"
+        status: "skipped",
+        errorMessage: null,
+        errorStatus: null
     };
 
-    const downloadedPath = await downloadToFile(sourceUrl, localPath);
+    let downloadedPath = null;
+    try {
+        // log("Asset download starting.", { slug, kind, sourceUrl, key: finalKey });
+        downloadedPath = await downloadToFile(normalizedUrl, localPath);
+    } catch (error) {
+        record.status = "failed";
+        record.errorStatus = error?.response?.status || null;
+        record.errorMessage = error?.message || "Asset download failed";
+        // log("Asset download failed.", {
+        //     slug,
+        //     kind,
+        //     sourceUrl,
+        //     key: finalKey,
+        //     status: record.errorStatus,
+        //     message: record.errorMessage
+        // });
+        return { record, resultUrl: sourceUrl };
+    }
+
     if (downloadedPath && config.s3Enabled) {
-        const s3Url = await uploadToS3(finalKey, downloadedPath);
-        record.s3Url = s3Url;
-        record.status = s3Url ? "uploaded" : "downloaded";
-        return { record, resultUrl: s3Url || sourceUrl };
+        try {
+            // log("Asset upload starting.", { slug, kind, sourceUrl, key: finalKey });
+            const s3Url = await uploadToS3(finalKey, downloadedPath);
+            record.s3Url = s3Url;
+            record.status = s3Url ? "uploaded" : "downloaded";
+            // log("Asset upload done.", { slug, kind, sourceUrl, key: finalKey, status: record.status });
+            return { record, resultUrl: s3Url || sourceUrl };
+        } catch (error) {
+            record.status = "failed";
+            record.errorStatus = error?.$metadata?.httpStatusCode || null;
+            record.errorMessage = error?.message || "Asset upload failed";
+            // log("Asset upload failed.", {
+            //     slug,
+            //     kind,
+            //     sourceUrl,
+            //     key: finalKey,
+            //     status: record.errorStatus,
+            //     message: record.errorMessage
+            // });
+            return { record, resultUrl: sourceUrl };
+        }
     }
 
     record.status = downloadedPath ? "downloaded" : "skipped";
+    // log("Asset download done (no upload).", { slug, kind, sourceUrl, key: finalKey, status: record.status });
     return { record, resultUrl: sourceUrl };
 };
 
-const mirrorUrlCached = async ({ sourceUrl, key, slug, kind, cache }) => {
+const mirrorUrlCached = async ({ sourceUrl, key, slug, kind, cache, problemType }) => {
     if (cache && cache.has(sourceUrl)) {
         return cache.get(sourceUrl);
     }
-    const result = await mirrorUrl({ sourceUrl, key, slug, kind });
+    const result = await mirrorUrl({ sourceUrl, key, slug, kind, problemType });
     if (cache) cache.set(sourceUrl, result);
     return result;
 };
 
-const syncLocation = async (detailData, location, slug, kind, cache) => {
+const syncLocation = async (detailData, location, slug, kind, cache, problemType) => {
     if (!location || !location.s3_http_url) return;
     const sourceUrl = location.s3_http_url;
     const key = location.object_key || extractKeyFromUrl(sourceUrl);
@@ -73,7 +157,8 @@ const syncLocation = async (detailData, location, slug, kind, cache) => {
         key,
         slug,
         kind,
-        cache
+        cache,
+        problemType
     });
     if (record) addAssetLog(detailData, record);
     if (resultUrl && resultUrl !== sourceUrl) {
@@ -82,7 +167,15 @@ const syncLocation = async (detailData, location, slug, kind, cache) => {
     }
 };
 
-const syncSimpleUrlField = async (detailData, container, field, slug, kind, cache) => {
+const syncSimpleUrlField = async (
+    detailData,
+    container,
+    field,
+    slug,
+    kind,
+    cache,
+    problemType
+) => {
     if (!container || !container[field]) return;
     const sourceUrl = container[field];
     if (typeof sourceUrl !== "string" || !sourceUrl.startsWith("http")) return;
@@ -92,7 +185,8 @@ const syncSimpleUrlField = async (detailData, container, field, slug, kind, cach
         key,
         slug,
         kind,
-        cache
+        cache,
+        problemType
     });
     if (record) addAssetLog(detailData, record);
     if (resultUrl && resultUrl !== sourceUrl) {
@@ -101,7 +195,7 @@ const syncSimpleUrlField = async (detailData, container, field, slug, kind, cach
     }
 };
 
-const syncDescriptionImages = async (detailData, slug, cache) => {
+const syncDescriptionImages = async (detailData, slug, cache, problemType) => {
     if (!detailData.description) return;
     const matches = [...detailData.description.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)];
     if (!matches.length) return;
@@ -114,7 +208,8 @@ const syncDescriptionImages = async (detailData, slug, cache) => {
             key,
             slug,
             kind: "description_image",
-            cache
+            cache,
+            problemType
         });
         if (record) addAssetLog(detailData, record);
         if (resultUrl && resultUrl !== sourceUrl) {
@@ -124,12 +219,12 @@ const syncDescriptionImages = async (detailData, slug, cache) => {
     detailData.description = updated;
 };
 
-const syncAttachments = async (detailData, slug, cache) => {
+const syncAttachments = async (detailData, slug, cache, problemType) => {
     if (!Array.isArray(detailData.attachments)) return;
     for (const attachment of detailData.attachments) {
         if (!attachment || typeof attachment !== "object") continue;
         if (attachment.s3_http_url) {
-            await syncLocation(detailData, attachment, slug, "attachment", cache);
+            await syncLocation(detailData, attachment, slug, "attachment", cache, problemType);
         } else if (attachment.url) {
             await syncSimpleUrlField(
                 detailData,
@@ -137,13 +232,35 @@ const syncAttachments = async (detailData, slug, cache) => {
                 "url",
                 slug,
                 "attachment",
-                cache
+                cache,
+                problemType
             );
         }
     }
 };
 
-const syncProjectBasedAssets = async (detailData, slug, cache) => {
+const syncPrivateAttachments = async (detailData, slug, cache, problemType) => {
+    if (!Array.isArray(detailData.private_attachments)) return;
+    for (let i = 0; i < detailData.private_attachments.length; i += 1) {
+        const sourceUrl = detailData.private_attachments[i];
+        if (typeof sourceUrl !== "string" || !sourceUrl.startsWith("http")) continue;
+        const key = extractKeyFromUrl(sourceUrl);
+        const { record, resultUrl } = await mirrorUrlCached({
+            sourceUrl,
+            key,
+            slug,
+            kind: "private_attachment",
+            cache,
+            problemType
+        });
+        if (record) addAssetLog(detailData, record);
+        if (resultUrl && resultUrl !== sourceUrl) {
+            detailData.private_attachments[i] = resultUrl;
+        }
+    }
+};
+
+const syncProjectBasedAssets = async (detailData, slug, cache, problemType) => {
     const projectData = detailData.extra_data?.project_based_problem_data;
     if (!projectData) return;
     await syncLocation(
@@ -151,14 +268,16 @@ const syncProjectBasedAssets = async (detailData, slug, cache) => {
         projectData.problem_solution_s3_location,
         slug,
         "problem_solution",
-        cache
+        cache,
+        problemType
     );
     await syncLocation(
         detailData,
         projectData.problem_stub_s3_location,
         slug,
         "problem_stub",
-        cache
+        cache,
+        problemType
     );
     await syncSimpleUrlField(
         detailData,
@@ -166,11 +285,12 @@ const syncProjectBasedAssets = async (detailData, slug, cache) => {
         "project_template",
         slug,
         "project_template",
-        cache
+        cache,
+        problemType
     );
 };
 
-const syncUixAssets = async (detailData, slug, cache) => {
+const syncUixAssets = async (detailData, slug, cache, problemType) => {
     if (!detailData.sample_solutions) return;
     await syncSimpleUrlField(
         detailData,
@@ -178,7 +298,8 @@ const syncUixAssets = async (detailData, slug, cache) => {
         "vanillajs",
         slug,
         "sample_solution_vanillajs",
-        cache
+        cache,
+        problemType
     );
     if (detailData.stubs) {
         await syncSimpleUrlField(
@@ -187,20 +308,42 @@ const syncUixAssets = async (detailData, slug, cache) => {
             "vanillajs",
             slug,
             "stub_vanillajs",
-            cache
+            cache,
+            problemType
         );
     }
 };
 
 const isHttpUrl = (value) => typeof value === "string" && /^https?:\/\//i.test(value);
 
+const decodeHtmlEntities = (value) => {
+    if (!value || typeof value !== "string") return value;
+    return value
+        .replace(/&quot;/g, "\"")
+        .replace(/&#34;/g, "\"")
+        .replace(/&amp;/g, "&");
+};
+
+const sanitizeUrlCandidate = (value) => {
+    if (!value || typeof value !== "string") return null;
+    let candidate = decodeHtmlEntities(value.trim());
+    candidate = candidate.replace(/[)"'\]}>,;]+$/g, "");
+    candidate = candidate.replace(/["']+$/g, "");
+    if (!isHttpUrl(candidate)) return null;
+    return candidate;
+};
+
 const extractUrls = (text) => {
     if (!isHttpUrl(text) && !text.includes("http")) return [];
     const matches = text.match(/https?:\/\/[^\s"'<>]+/gi);
-    return matches ? Array.from(new Set(matches)) : [];
+    if (!matches) return [];
+    const cleaned = matches
+        .map((url) => sanitizeUrlCandidate(url))
+        .filter((url) => Boolean(url));
+    return Array.from(new Set(cleaned));
 };
 
-const replaceUrlsInText = async (detailData, text, slug, cache) => {
+const replaceUrlsInText = async (detailData, text, slug, cache, problemType) => {
     let updated = text;
     const urls = extractUrls(text);
     for (const url of urls) {
@@ -210,7 +353,8 @@ const replaceUrlsInText = async (detailData, text, slug, cache) => {
             key,
             slug,
             kind: "deep_scan",
-            cache
+            cache,
+            problemType
         });
         if (record) addAssetLog(detailData, record);
         if (resultUrl && resultUrl !== url) {
@@ -220,7 +364,7 @@ const replaceUrlsInText = async (detailData, text, slug, cache) => {
     return updated;
 };
 
-const deepScanUrls = async (detailData, slug, cache) => {
+const deepScanUrls = async (detailData, slug, cache, problemType) => {
     if (!config.assetScanAllUrls) return;
     const visited = new Set();
 
@@ -233,7 +377,13 @@ const deepScanUrls = async (detailData, slug, cache) => {
             for (let i = 0; i < node.length; i += 1) {
                 const value = node[i];
                 if (typeof value === "string") {
-                    node[i] = await replaceUrlsInText(detailData, value, slug, cache);
+                    node[i] = await replaceUrlsInText(
+                        detailData,
+                        value,
+                        slug,
+                        cache,
+                        problemType
+                    );
                 } else if (value && typeof value === "object") {
                     await walk(value);
                 }
@@ -250,7 +400,13 @@ const deepScanUrls = async (detailData, slug, cache) => {
                 continue;
             }
             if (typeof value === "string") {
-                node[key] = await replaceUrlsInText(detailData, value, slug, cache);
+                node[key] = await replaceUrlsInText(
+                    detailData,
+                    value,
+                    slug,
+                    cache,
+                    problemType
+                );
             } else if (value && typeof value === "object") {
                 await walk(value);
             }
@@ -265,16 +421,17 @@ const processDetailAssets = async (detailData, slug) => {
     const cache = new Map();
     const problemType = detailData.problem_type;
     if (PROJECT_BASED_TYPES.has(problemType) || detailData.extra_data?.project_based_problem_data) {
-        await syncProjectBasedAssets(detailData, slug, cache);
-        await syncDescriptionImages(detailData, slug, cache);
-        await syncAttachments(detailData, slug, cache);
+        await syncProjectBasedAssets(detailData, slug, cache, problemType);
+        await syncDescriptionImages(detailData, slug, cache, problemType);
+        await syncAttachments(detailData, slug, cache, problemType);
     }
     if (problemType === "UIX") {
-        await syncUixAssets(detailData, slug, cache);
-        await syncDescriptionImages(detailData, slug, cache);
-        await syncAttachments(detailData, slug, cache);
+        await syncUixAssets(detailData, slug, cache, problemType);
+        await syncDescriptionImages(detailData, slug, cache, problemType);
+        await syncAttachments(detailData, slug, cache, problemType);
     }
-    await deepScanUrls(detailData, slug, cache);
+    await syncPrivateAttachments(detailData, slug, cache, problemType);
+    await deepScanUrls(detailData, slug, cache, problemType);
 };
 
 module.exports = { processDetailAssets };
