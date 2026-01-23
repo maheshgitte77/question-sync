@@ -81,6 +81,8 @@ module.exports = {
     assetDownloadDir: process.env.ASSET_DOWNLOAD_DIR || "downloads",
     assetKeyPrefix: process.env.ASSET_KEY_PREFIX || "Questions_Assets",
     assetCleanupEnabled: parseBool(process.env.ASSET_CLEANUP_ENABLED, true),
+    assetUrlStrict: parseBool(process.env.ASSET_URL_STRICT, true),
+    assetHeadCheckEnabled: parseBool(process.env.ASSET_HEAD_CHECK_ENABLED, false),
     s3Bucket,
     s3Region,
     s3AccessKeyId,

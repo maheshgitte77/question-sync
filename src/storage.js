@@ -24,11 +24,7 @@ const ensureDir = async (filePath) => {
     await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
 };
 
-const downloadToFile = async (url, destPath) => {
-    if (!config.assetDownloadEnabled) return null;
-    if (!config.assetOverwrite && fs.existsSync(destPath)) {
-        return destPath;
-    }
+const buildDefaultHeaders = () => {
     const headers = {
         Accept: "application/octet-stream,*/*;q=0.9",
         "User-Agent": config.apiUserAgent
@@ -36,10 +32,30 @@ const downloadToFile = async (url, destPath) => {
     if (config.apiReferer) headers.Referer = config.apiReferer;
     if (config.apiCookie) headers.Cookie = config.apiCookie;
     if (config.apiCsrfToken) headers["X-Csrftoken"] = config.apiCsrfToken;
+    return headers;
+};
+
+const headUrl = async (url) => {
+    const response = await axios.head(url, {
+        timeout: config.requestTimeoutMs,
+        headers: buildDefaultHeaders(),
+        validateStatus: () => true
+    });
+    return {
+        ok: response.status >= 200 && response.status < 400,
+        status: response.status
+    };
+};
+
+const downloadToFile = async (url, destPath) => {
+    if (!config.assetDownloadEnabled) return null;
+    if (!config.assetOverwrite && fs.existsSync(destPath)) {
+        return destPath;
+    }
     const response = await axios.get(url, {
         responseType: "arraybuffer",
         timeout: config.requestTimeoutMs,
-        headers
+        headers: buildDefaultHeaders()
     });
     await ensureDir(destPath);
     await fs.promises.writeFile(destPath, Buffer.from(response.data));
@@ -84,6 +100,7 @@ const uploadToS3 = async (key, filePath) => {
 
 module.exports = {
     downloadToFile,
-    uploadToS3
+    uploadToS3,
+    headUrl
 };
 

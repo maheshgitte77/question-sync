@@ -2,7 +2,7 @@ const path = require("path");
 const crypto = require("crypto");
 const fs = require("fs");
 const config = require("./config");
-const { downloadToFile, uploadToS3 } = require("./storage");
+const { downloadToFile, uploadToS3, headUrl } = require("./storage");
 
 const PROJECT_BASED_TYPES = new Set(["PBT", "PBD", "PFE", "PFS"]);
 
@@ -26,6 +26,29 @@ const normalizeUrl = (url) => {
             return url;
         }
     }
+};
+
+const stripTrailingSizeSegments = (url) => {
+    if (!url || typeof url !== "string") return url;
+    try {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/^(.*\.[a-z0-9]+)\/\d+\/\d+$/i);
+        if (!match) return url;
+        parsed.pathname = match[1];
+        return parsed.toString();
+    } catch (_error) {
+        return url;
+    }
+};
+
+const isSafeUrl = (url) => {
+    if (!url || typeof url !== "string") return false;
+    const trimmed = url.trim();
+    if (config.assetUrlStrict && !trimmed.startsWith("https://")) return false;
+    if (!config.assetUrlStrict && !/^https?:\/\//i.test(trimmed)) return false;
+    if (trimmed.startsWith("data:")) return false;
+    if (trimmed.includes("%22") || trimmed.includes("\"")) return false;
+    return true;
 };
 
 const extractKeyFromUrl = (url) => {
@@ -61,7 +84,18 @@ const addAssetLog = (detailData, record) => {
     if (!detailData.extra_data.asset_sync) {
         detailData.extra_data.asset_sync = { files: [], lastSyncedAt: null };
     }
-    detailData.extra_data.asset_sync.files.push(record);
+    const files = detailData.extra_data.asset_sync.files;
+    const isDuplicate = files.some(
+        (item) =>
+            item &&
+            item.kind === record.kind &&
+            item.slug === record.slug &&
+            item.sourceUrl === record.sourceUrl &&
+            item.key === record.key
+    );
+    if (!isDuplicate) {
+        files.push(record);
+    }
     detailData.extra_data.asset_sync.lastSyncedAt = new Date().toISOString();
 };
 
@@ -70,7 +104,21 @@ const mirrorUrl = async ({ sourceUrl, key, slug, kind, problemType }) => {
         return { record: null, resultUrl: sourceUrl };
     }
 
-    const normalizedUrl = normalizeUrl(sourceUrl);
+    const normalizedUrl = stripTrailingSizeSegments(normalizeUrl(sourceUrl));
+    if (!isSafeUrl(normalizedUrl)) {
+        const record = {
+            kind,
+            slug,
+            sourceUrl,
+            key: null,
+            localPath: null,
+            s3Url: null,
+            status: "skipped_invalid",
+            errorMessage: "URL failed safety check",
+            errorStatus: null
+        };
+        return { record, resultUrl: sourceUrl };
+    }
     if (config.s3BaseUrl && normalizedUrl.startsWith(config.s3BaseUrl)) {
         return { record: null, resultUrl: sourceUrl };
     }
@@ -95,6 +143,15 @@ const mirrorUrl = async ({ sourceUrl, key, slug, kind, problemType }) => {
     let downloadedPath = null;
     try {
         // log("Asset download starting.", { slug, kind, sourceUrl, key: finalKey });
+        if (config.assetHeadCheckEnabled) {
+            const headResult = await headUrl(normalizedUrl);
+            if (!headResult.ok) {
+                record.status = "skipped_head";
+                record.errorStatus = headResult.status;
+                record.errorMessage = `HEAD check failed (${headResult.status})`;
+                return { record, resultUrl: sourceUrl };
+            }
+        }
         downloadedPath = await downloadToFile(normalizedUrl, localPath);
     } catch (error) {
         record.status = "failed";
@@ -148,11 +205,12 @@ const mirrorUrl = async ({ sourceUrl, key, slug, kind, problemType }) => {
 };
 
 const mirrorUrlCached = async ({ sourceUrl, key, slug, kind, cache, problemType }) => {
-    if (cache && cache.has(sourceUrl)) {
-        return cache.get(sourceUrl);
+    const normalizedUrl = stripTrailingSizeSegments(normalizeUrl(sourceUrl));
+    if (cache && cache.has(normalizedUrl)) {
+        return cache.get(normalizedUrl);
     }
-    const result = await mirrorUrl({ sourceUrl, key, slug, kind, problemType });
-    if (cache) cache.set(sourceUrl, result);
+    const result = await mirrorUrl({ sourceUrl: normalizedUrl, key, slug, kind, problemType });
+    if (cache) cache.set(normalizedUrl, result);
     return result;
 };
 
@@ -337,6 +395,7 @@ const sanitizeUrlCandidate = (value) => {
     let candidate = decodeHtmlEntities(value.trim());
     candidate = candidate.replace(/[)"'\]}>,;]+$/g, "");
     candidate = candidate.replace(/["']+$/g, "");
+    candidate = stripTrailingSizeSegments(candidate);
     if (!isHttpUrl(candidate)) return null;
     return candidate;
 };
