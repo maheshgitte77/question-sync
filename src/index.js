@@ -13,17 +13,33 @@ const log = (message, meta = null) => {
     process.stdout.write(`[${stamp}] ${message}\n`);
 };
 
-const buildListParams = (offset) => ({
+const buildListParams = (offset, listQueryOverride) => ({
     index: config.listIndex,
     limit: config.listLimit,
     narrow: config.listNarrow,
     offset,
     order_by: config.listOrderBy,
     page_type: config.listPageType,
-    q: config.listQuery,
+    q: listQueryOverride ?? config.listQuery,
     tag: config.listTag,
     view: config.listView
 });
+
+const getListError = (meta) => {
+    if (!meta || typeof meta !== "object") return null;
+    if (meta.error) return meta.error;
+    if (meta.error_type) return `${meta.error_type}`;
+    return null;
+};
+
+const isMaxWindowError = (message) => {
+    if (!message) return false;
+    return (
+        message.includes("max_result_window") ||
+        message.includes("Result window is too large") ||
+        message.includes("result window is too large")
+    );
+};
 
 const buildDefaultHeaders = () => {
     const headers = {
@@ -71,8 +87,8 @@ const requestWithRetry = async (requestFn, context) => {
     throw lastError;
 };
 
-const fetchListPage = async (offset) => {
-    const params = buildListParams(offset);
+const fetchListPage = async (offset, listQueryOverride) => {
+    const params = buildListParams(offset, listQueryOverride);
     const response = await axiosInstance.get(config.listBaseUrl, { params });
     return response.data;
 };
@@ -146,6 +162,17 @@ const main = async () => {
         _id: config.stateDocId
     });
 
+    const queryList =
+        config.listQueryList && config.listQueryList.length
+            ? config.listQueryList
+            : null;
+    if (existingState?.status === "completed" && !config.forceResume) {
+        if (!queryList || existingState?.multiQuery?.currentIndex >= queryList.length) {
+            log("Sync already completed. Set FORCE_RESUME=true to run again.");
+            return;
+        }
+    }
+
     let offset = existingState?.lastOffset ?? 0;
     let totalCount = existingState?.totalCount ?? null;
     let totalPages = existingState?.totalPages ?? null;
@@ -175,192 +202,349 @@ const main = async () => {
         delayMode: config.delayMode
     });
 
-    while (true) {
-        let listResponse;
-        try {
-            listRequests += 1;
-            await updateState(stateCollection, { listRequests });
-            listResponse = await requestWithRetry(
-                () => fetchListPage(offset),
-                { type: "list", offset, url: config.listBaseUrl }
-            );
-            log("List page fetched.", { offset, count: listResponse?.objects?.[0]?.objects?.length || 0 });
-        } catch (error) {
-            failedRequests += 1;
-            await updateState(stateCollection, {
-                failedRequests,
-                lastError: error.message,
-                lastOffset: offset
-            });
-            throw error;
-        }
+    const multiQueryState =
+        existingState?.multiQuery || {
+            queries: queryList || [],
+            currentIndex: 0,
+            perQuery: {}
+        };
 
-        const { items, meta } = getListPayload(listResponse);
-        if (!items.length) {
-            await updateState(stateCollection, {
-                status: "completed",
-                completedAt: new Date(),
-                lastOffset: offset,
-                totalCount,
-                totalPages
-            });
-            log("No more list items; sync completed.", { offset, totalCount, totalPages });
-            break;
-        }
-
-        if (meta.total_count !== undefined) totalCount = meta.total_count;
-        if (meta.total_pages !== undefined) totalPages = meta.total_pages;
-
-        const itemsWithSlug = items.filter((item) => item.slug);
-        const bulkOps = itemsWithSlug.map((item) => ({
-            updateOne: {
-                filter: { slug: item.slug },
-                update: { $set: buildListDoc(item, meta) },
-                upsert: true
-            }
-        }));
-        if (bulkOps.length > 0) {
-            const bulkResult = await listCollection.bulkWrite(bulkOps, {
-                ordered: false
-            });
-            listItemsSaved += bulkResult.upsertedCount || 0;
-            log("List items saved.", {
-                upserted: bulkResult.upsertedCount || 0,
-                matched: bulkResult.matchedCount || 0,
-                modified: bulkResult.modifiedCount || 0
-            });
-        }
-
+    const persistState = async (updates) => {
         await updateState(stateCollection, {
-            lastOffset: offset,
-            lastPageNumber: meta.page_number ?? null,
-            totalCount,
-            totalPages,
-            listItemsSaved,
-            lastListMeta: meta,
-            lastListFetchedAt: new Date()
+            ...updates,
+            multiQuery: multiQueryState
         });
+    };
 
-        const slugs = itemsWithSlug.map((item) => item.slug);
-        let existingSlugSet = new Set();
-        if (slugs.length) {
-            const existing = await detailCollection
-                .find({ slug: { $in: slugs } }, { projection: { slug: 1 } })
-                .toArray();
-            existingSlugSet = new Set(existing.map((doc) => doc.slug));
-            log("Existing detail slugs loaded.", { count: existingSlugSet.size });
-        }
+    const runQuery = async (listQueryOverride) => {
+        const queryKey = listQueryOverride || "";
+        const perQuery =
+            multiQueryState.perQuery[queryKey] || {
+                status: "running",
+                lastOffset: 0,
+                listRequests: 0,
+                detailRequests: 0,
+                listItemsSaved: 0,
+                detailItemsSaved: 0,
+                detailItemsSkipped: 0,
+                failedRequests: 0
+            };
+        multiQueryState.perQuery[queryKey] = perQuery;
 
-        for (let i = 0; i < itemsWithSlug.length; i += 1) {
-            const item = itemsWithSlug[i];
-            if (config.skipExistingDetails && existingSlugSet.has(item.slug)) {
-                detailItemsSkipped += 1;
-                await updateState(stateCollection, {
-                    detailItemsSkipped,
-                    lastSlugProcessed: item.slug
+        let localOffset = perQuery.lastOffset ?? 0;
+
+        while (true) {
+            if (
+                Number.isFinite(config.listMaxResultWindow) &&
+                localOffset + config.listLimit > config.listMaxResultWindow
+            ) {
+                const message = `Reached max result window (${config.listMaxResultWindow}).`;
+                perQuery.status = "completed";
+                perQuery.lastOffset = localOffset;
+                perQuery.stopReason = "max_result_window";
+                perQuery.lastError = message;
+                perQuery.completedAt = new Date();
+                await persistState({
+                    status: "running",
+                    lastOffset: localOffset,
+                    totalCount,
+                    totalPages,
+                    lastError: message,
+                    stopReason: "max_result_window",
+                    currentQuery: queryKey
                 });
-                log("Detail skipped (already exists).", { slug: item.slug });
-                continue;
+                log(message, { offset: localOffset, listLimit: config.listLimit, query: queryKey });
+                break;
             }
-            if (!config.skipExistingDetails && existingSlugSet.has(item.slug)) {
-                log("Detail exists; re-fetching.", { slug: item.slug });
-            }
-
-            let detailData;
-            const detailStart = Date.now();
+            let listResponse;
             try {
-                detailRequests += 1;
-                await updateState(stateCollection, { detailRequests });
-                log("Detail request starting.", { slug: item.slug, offset });
-                detailData = await requestWithRetry(
-                    () => fetchDetail(item.slug),
-                    {
-                        type: "detail",
-                        slug: item.slug,
-                        offset,
-                        url: `${config.detailBaseUrl}/${item.slug}`
-                    }
+                listRequests += 1;
+                perQuery.listRequests += 1;
+                await persistState({ listRequests, currentQuery: queryKey });
+                listResponse = await requestWithRetry(
+                    () => fetchListPage(localOffset, listQueryOverride),
+                    { type: "list", offset: localOffset, url: config.listBaseUrl, query: queryKey }
                 );
-                log("Detail fetched.", { slug: item.slug });
+                log("List page fetched.", {
+                    offset: localOffset,
+                    query: queryKey,
+                    count: listResponse?.objects?.[0]?.objects?.length || 0
+                });
             } catch (error) {
                 failedRequests += 1;
-                await updateState(stateCollection, {
+                perQuery.failedRequests += 1;
+                perQuery.lastError = error.message;
+                await persistState({
                     failedRequests,
                     lastError: error.message,
-                    lastSlugProcessed: item.slug,
-                    lastOffset: offset
+                    lastOffset: localOffset,
+                    currentQuery: queryKey
                 });
-                continue;
+                throw error;
             }
 
-            try {
-                log("Asset processing started.", { slug: item.slug });
-                await processDetailAssets(detailData, item.slug);
-                log("Assets processed.", { slug: item.slug });
-            } catch (error) {
-                failedRequests += 1;
-                await updateState(stateCollection, {
-                    failedRequests,
-                    lastError: error.message,
-                    lastSlugProcessed: item.slug,
-                    lastOffset: offset
+            const { items, meta } = getListPayload(listResponse);
+            const listError = getListError(meta);
+            if (listError) {
+                const stopReason = isMaxWindowError(listError)
+                    ? "max_result_window"
+                    : "list_error";
+                perQuery.status = stopReason === "max_result_window" ? "completed" : "failed";
+                perQuery.lastOffset = localOffset;
+                perQuery.lastError = listError;
+                perQuery.stopReason = stopReason;
+                if (stopReason === "max_result_window") {
+                    perQuery.completedAt = new Date();
+                }
+                await persistState({
+                    status: stopReason === "max_result_window" ? "running" : "failed",
+                    completedAt: stopReason === "max_result_window" ? new Date() : null,
+                    lastOffset: localOffset,
+                    totalCount,
+                    totalPages,
+                    lastError: listError,
+                    stopReason,
+                    currentQuery: queryKey
                 });
-                await errorCollection.insertOne({
-                    type: "asset",
+                log("List error received; stopping.", {
+                    offset: localOffset,
+                    error: listError,
+                    query: queryKey
+                });
+                break;
+            }
+            if (!items.length) {
+                perQuery.status = "completed";
+                perQuery.lastOffset = localOffset;
+                perQuery.completedAt = new Date();
+                await persistState({
+                    status: "running",
+                    completedAt: new Date(),
+                    lastOffset: localOffset,
+                    totalCount,
+                    totalPages,
+                    currentQuery: queryKey
+                });
+                log("No more list items; query completed.", { offset: localOffset, totalCount, totalPages, query: queryKey });
+                break;
+            }
+
+            if (meta.total_count !== undefined) totalCount = meta.total_count;
+            if (meta.total_pages !== undefined) totalPages = meta.total_pages;
+
+            const itemsWithSlug = items.filter((item) => item.slug);
+            const bulkOps = itemsWithSlug.map((item) => ({
+                updateOne: {
+                    filter: { slug: item.slug },
+                    update: { $set: buildListDoc(item, meta) },
+                    upsert: true
+                }
+            }));
+            if (bulkOps.length > 0) {
+                const bulkResult = await listCollection.bulkWrite(bulkOps, {
+                    ordered: false
+                });
+                const upserted = bulkResult.upsertedCount || 0;
+                listItemsSaved += upserted;
+                perQuery.listItemsSaved += upserted;
+                log("List items saved.", {
+                    upserted,
+                    matched: bulkResult.matchedCount || 0,
+                    modified: bulkResult.modifiedCount || 0,
+                    query: queryKey
+                });
+            }
+
+            perQuery.lastOffset = localOffset;
+            perQuery.lastPageNumber = meta.page_number ?? null;
+            perQuery.lastListMeta = meta;
+            perQuery.lastListFetchedAt = new Date();
+            await persistState({
+                lastOffset: localOffset,
+                lastPageNumber: meta.page_number ?? null,
+                totalCount,
+                totalPages,
+                listItemsSaved,
+                lastListMeta: meta,
+                lastListFetchedAt: new Date(),
+                currentQuery: queryKey
+            });
+
+            const slugs = itemsWithSlug.map((item) => item.slug);
+            let existingSlugSet = new Set();
+            if (slugs.length) {
+                const existing = await detailCollection
+                    .find({ slug: { $in: slugs } }, { projection: { slug: 1 } })
+                    .toArray();
+                existingSlugSet = new Set(existing.map((doc) => doc.slug));
+                log("Existing detail slugs loaded.", { count: existingSlugSet.size, query: queryKey });
+            }
+
+            for (let i = 0; i < itemsWithSlug.length; i += 1) {
+                const item = itemsWithSlug[i];
+                if (config.skipExistingDetails && existingSlugSet.has(item.slug)) {
+                    detailItemsSkipped += 1;
+                    perQuery.detailItemsSkipped += 1;
+                    await persistState({
+                        detailItemsSkipped,
+                        lastSlugProcessed: item.slug,
+                        currentQuery: queryKey
+                    });
+                    log("Detail skipped (already exists).", { slug: item.slug, query: queryKey });
+                    continue;
+                }
+                if (config.detailOnlyIfMissing && existingSlugSet.has(item.slug)) {
+                    detailItemsSkipped += 1;
+                    perQuery.detailItemsSkipped += 1;
+                    await persistState({
+                        detailItemsSkipped,
+                        lastSlugProcessed: item.slug,
+                        currentQuery: queryKey
+                    });
+                    log("Detail skipped (exists; only missing enabled).", { slug: item.slug, query: queryKey });
+                    continue;
+                }
+                if (!config.skipExistingDetails && existingSlugSet.has(item.slug)) {
+                    log("Detail exists; re-fetching.", { slug: item.slug, query: queryKey });
+                }
+
+                let detailData;
+                const detailStart = Date.now();
+                try {
+                    detailRequests += 1;
+                    perQuery.detailRequests += 1;
+                    await persistState({ detailRequests, currentQuery: queryKey });
+                    log("Detail request starting.", { slug: item.slug, offset: localOffset, query: queryKey });
+                    detailData = await requestWithRetry(
+                        () => fetchDetail(item.slug),
+                        {
+                            type: "detail",
+                            slug: item.slug,
+                            offset: localOffset,
+                            url: `${config.detailBaseUrl}/${item.slug}`,
+                            query: queryKey
+                        }
+                    );
+                    log("Detail fetched.", { slug: item.slug, query: queryKey });
+                } catch (error) {
+                    failedRequests += 1;
+                    perQuery.failedRequests += 1;
+                    perQuery.lastError = error.message;
+                    await persistState({
+                        failedRequests,
+                        lastError: error.message,
+                        lastSlugProcessed: item.slug,
+                        lastOffset: localOffset,
+                        currentQuery: queryKey
+                    });
+                    continue;
+                }
+
+                try {
+                    log("Asset processing started.", { slug: item.slug, query: queryKey });
+                    await processDetailAssets(detailData, item.slug);
+                    log("Assets processed.", { slug: item.slug, query: queryKey });
+                } catch (error) {
+                    failedRequests += 1;
+                    perQuery.failedRequests += 1;
+                    perQuery.lastError = error.message;
+                    await persistState({
+                        failedRequests,
+                        lastError: error.message,
+                        lastSlugProcessed: item.slug,
+                        lastOffset: localOffset,
+                        currentQuery: queryKey
+                    });
+                    await errorCollection.insertOne({
+                        type: "asset",
+                        slug: item.slug,
+                        offset: localOffset,
+                        message: error.message,
+                        createdAt: new Date()
+                    });
+                }
+
+                log("Detail update starting.", { slug: item.slug, query: queryKey });
+                const detailResult = await detailCollection.updateOne(
+                    { slug: item.slug },
+                    { $set: buildDetailDoc(item.slug, detailData, meta) },
+                    { upsert: true }
+                );
+                detailItemsSaved += 1;
+                perQuery.detailItemsSaved += 1;
+                log("Detail saved.", {
                     slug: item.slug,
-                    offset,
-                    message: error.message,
-                    createdAt: new Date()
+                    matched: detailResult.matchedCount || 0,
+                    modified: detailResult.modifiedCount || 0,
+                    upserted: detailResult.upsertedCount || 0,
+                    durationMs: Date.now() - detailStart,
+                    query: queryKey
                 });
+
+                perQuery.lastSlugProcessed = item.slug;
+                perQuery.lastDetailFetchedAt = new Date();
+                await persistState({
+                    detailItemsSaved,
+                    lastSlugProcessed: item.slug,
+                    lastDetailFetchedAt: new Date(),
+                    currentQuery: queryKey
+                });
+
+                const detailDelay = calcDelayMs(
+                    config.delayMode,
+                    config.detailDelayMinSec,
+                    config.detailDelayMaxSec
+                );
+                if (detailDelay > 0) {
+                    log("Detail delay.", { slug: item.slug, delayMs: detailDelay, query: queryKey });
+                    await sleep(detailDelay);
+                    log("Detail delay done.", { slug: item.slug, query: queryKey });
+                }
             }
 
-            log("Detail update starting.", { slug: item.slug });
-            const detailResult = await detailCollection.updateOne(
-                { slug: item.slug },
-                { $set: buildDetailDoc(item.slug, detailData, meta) },
-                { upsert: true }
-            );
-            detailItemsSaved += 1;
-            log("Detail saved.", {
-                slug: item.slug,
-                matched: detailResult.matchedCount || 0,
-                modified: detailResult.modifiedCount || 0,
-                upserted: detailResult.upsertedCount || 0,
-                durationMs: Date.now() - detailStart
-            });
+            localOffset += config.listLimit;
+            perQuery.lastOffset = localOffset;
+            await persistState({ lastOffset: localOffset, currentQuery: queryKey });
+            log("Page completed.", { nextOffset: localOffset, query: queryKey });
 
-            await updateState(stateCollection, {
-                detailItemsSaved,
-                lastSlugProcessed: item.slug,
-                lastDetailFetchedAt: new Date()
-            });
-
-            const detailDelay = calcDelayMs(
+            const listDelay = calcDelayMs(
                 config.delayMode,
-                config.detailDelayMinSec,
-                config.detailDelayMaxSec
+                config.listDelayMinSec,
+                config.listDelayMaxSec
             );
-            if (detailDelay > 0) {
-                log("Detail delay.", { slug: item.slug, delayMs: detailDelay });
-                await sleep(detailDelay);
-                log("Detail delay done.", { slug: item.slug });
+            if (listDelay > 0) {
+                log("List delay.", { delayMs: listDelay, query: queryKey });
+                await sleep(listDelay);
+                log("List delay done.", { delayMs: listDelay, query: queryKey });
             }
         }
+    };
 
-        offset += config.listLimit;
-        await updateState(stateCollection, { lastOffset: offset });
-        log("Page completed.", { nextOffset: offset });
-
-        const listDelay = calcDelayMs(
-            config.delayMode,
-            config.listDelayMinSec,
-            config.listDelayMaxSec
-        );
-        if (listDelay > 0) {
-            log("List delay.", { delayMs: listDelay });
-            await sleep(listDelay);
-            log("List delay done.", { delayMs: listDelay });
+    if (queryList && queryList.length) {
+        if (!multiQueryState.queries.length) {
+            multiQueryState.queries = queryList;
         }
+        for (let i = multiQueryState.currentIndex || 0; i < queryList.length; i += 1) {
+            const query = queryList[i];
+            multiQueryState.currentIndex = i;
+            await persistState({ status: "running", currentQuery: query });
+            log("Starting list query.", { query });
+            await runQuery(query);
+        }
+        await persistState({
+            status: "completed",
+            completedAt: new Date(),
+            currentQuery: null
+        });
+        log("All queries completed.");
+    } else {
+        await runQuery(null);
+        await persistState({
+            status: "completed",
+            completedAt: new Date(),
+            currentQuery: null
+        });
+        log("Sync completed.");
     }
 };
 

@@ -53,8 +53,13 @@ module.exports = {
     listOrderBy: process.env.LIST_ORDER_BY || "-modified",
     listPageType: process.env.LIST_PAGE_TYPE || "library",
     listQuery: process.env.LIST_QUERY || "",
+    listQueryList: (process.env.LIST_QUERY_LIST || "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0),
     listTag: process.env.LIST_TAG || "",
     listView: process.env.LIST_VIEW || "",
+    listMaxResultWindow: parseIntSafe(process.env.LIST_MAX_RESULT_WINDOW, 10000),
     detailEnv: process.env.DETAIL_ENV || "",
     detailUser: process.env.DETAIL_USER || "",
     requestTimeoutMs: parseIntSafe(process.env.REQUEST_TIMEOUT_MS, 20000),
@@ -62,6 +67,7 @@ module.exports = {
     retryDelaySec: parseFloatSafe(process.env.RETRY_DELAY_SEC, 5),
     rateLimitDelaySec: parseFloatSafe(process.env.RATE_LIMIT_DELAY_SEC, 60),
     skipExistingDetails: parseBool(process.env.SKIP_EXISTING_DETAILS, false),
+    detailOnlyIfMissing: parseBool(process.env.DETAIL_ONLY_IF_MISSING, false),
     delayMode,
     detailDelayMinSec: parseFloatSafe(process.env.DETAIL_DELAY_MIN_SEC, 1),
     detailDelayMaxSec: parseFloatSafe(process.env.DETAIL_DELAY_MAX_SEC, 3),
@@ -83,6 +89,7 @@ module.exports = {
     assetCleanupEnabled: parseBool(process.env.ASSET_CLEANUP_ENABLED, true),
     assetUrlStrict: parseBool(process.env.ASSET_URL_STRICT, true),
     assetHeadCheckEnabled: parseBool(process.env.ASSET_HEAD_CHECK_ENABLED, false),
+    forceResume: parseBool(process.env.FORCE_RESUME, false),
     s3Bucket,
     s3Region,
     s3AccessKeyId,
